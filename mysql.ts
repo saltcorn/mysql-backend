@@ -33,6 +33,19 @@ import { reprAsJson } from "@saltcorn/db-common/sqlite-commons";
  */
 const mkVal = (v: any): any => (reprAsJson(v) ? JSON.stringify(v) : v);
 
+const normalizePlaceholders = (
+  text: string,
+  params?: any[],
+): { text: string; params?: any[] } => {
+  if (!params || !text.match(/\$\d+/)) return { text, params };
+  const orderedParams: any[] = [];
+  const normalizedText = text.replace(/\$(\d+)/g, (_match, index) => {
+    orderedParams.push(params[+index - 1]);
+    return "?";
+  });
+  return { text: normalizedText, params: orderedParams };
+};
+
 let getTenantSchema: () => string;
 let getRequestContext: () => any;
 let getConnectObject: ((connObj?: any) => any) | null = null;
@@ -291,7 +304,8 @@ export const count = async (
     : `SELECT COUNT(*) AS count ${core_sql}`;
   sql_log(sql, values);
   const [rows]: any = await getMyClient(opts).query(sql, values);
-  return parseInt(rows[0].count);
+  const countValue = rows[0].count ?? Object.values(rows[0])[0];
+  return parseInt(String(countValue));
 };
 
 /**
@@ -521,6 +535,37 @@ export const reset_sequence = async (
   await getMyClient().query(alterSql);
 };
 
+/*
+ * MySQL cannot index/unique-constrain a TEXT/BLOB column without an explicit
+ * key prefix length ("BLOB/TEXT column used in key specification without a
+ * key length"). Saltcorn's String type maps to TEXT, so index/unique targets
+ * frequently are TEXT columns - look their types up and add a prefix. 191
+ * utf8mb4 chars fits the classic 767-byte InnoDB key limit.
+ */
+const keyColumnExprs = async (
+  table_name: string,
+  field_names: string[],
+): Promise<string> => {
+  const [rows]: any = await getMyClient().query(
+    `SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`,
+    [getTenantSchema(), table_name],
+  );
+  const needsPrefix = new Set(
+    rows
+      .filter((r: any) =>
+        /text|blob/i.test(r.DATA_TYPE || r.data_type || ""),
+      )
+      .map((r: any) => r.COLUMN_NAME || r.column_name),
+  );
+  return field_names
+    .map(
+      (f) =>
+        `"${sqlsanitize(f)}"${needsPrefix.has(sqlsanitize(f)) ? "(191)" : ""}`,
+    )
+    .join(",");
+};
+
 /**
  * Add unique constraint
  * @param {string} table_name - table name
@@ -535,9 +580,10 @@ export const add_unique_constraint = async (
     table_name,
   )}" add CONSTRAINT "${sqlsanitize(table_name)}_${field_names
     .map((f) => sqlsanitize(f))
-    .join("_")}_unique" UNIQUE (${field_names
-    .map((f) => `"${sqlsanitize(f)}"`)
-    .join(",")});`;
+    .join("_")}_unique" UNIQUE (${await keyColumnExprs(
+    table_name,
+    field_names,
+  )});`;
   sql_log(sql);
   await getMyClient().query(sql);
 };
@@ -582,7 +628,7 @@ export const add_index = async (
     field_name,
   )}_index" on "${getTenantSchema()}"."${sqlsanitize(
     table_name,
-  )}" ("${sqlsanitize(field_name)}");`;
+  )}" (${await keyColumnExprs(table_name, [field_name])});`;
   sql_log(sql);
   await getMyClient().query(sql);
 };
@@ -835,13 +881,23 @@ export const whenTransactionisFree = (
 };
 
 export const query = async (text: string, params?: any[]): Promise<any> => {
-  sql_log(text, params);
-  const [rows] = await getMyClient().query(text, params);
+  const normalized = normalizePlaceholders(text, params);
+  sql_log(normalized.text, normalized.params);
+  const [rows] = await getMyClient().query(normalized.text, normalized.params);
   return { rows };
 };
 
 export { mkWhere };
 
+// Registered by saltcorn-data's db/index.ts as the default dialect for the
+// boolean-signature mkWhere/mkSelectOptions, so core code that builds SQL
+// itself (getJoinedQuery, aggregation subqueries, ...) emits "?" placeholders
+// and LIKE/REGEXP/JSON_EXTRACT etc. instead of assuming Postgres.
+export const sqlDialectFactory = (initCount?: number) =>
+  mysqlPlaceHolderStack();
+
+export const driverName = "mysql";
+export const array_agg_sql_fn = "JSON_ARRAYAGG";
 export const serial_pk_sql_type = "INT AUTO_INCREMENT";
 export const json_sql_type = "JSON";
 export const indexable_text_sql_type = "VARCHAR(255)";
