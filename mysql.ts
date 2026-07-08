@@ -174,7 +174,7 @@ const buildPool = (connectObj: any): Pool => {
     ? mysql.createPool(
         `${connectObj.connectionString}${
           connectObj.connectionString.includes("?") ? "&" : "?"
-        }multipleStatements=true`
+        }multipleStatements=true`,
       )
     : mysql.createPool({
         host: connectObj.host,
@@ -553,9 +553,7 @@ const keyColumnExprs = async (
   );
   const needsPrefix = new Set(
     rows
-      .filter((r: any) =>
-        /text|blob/i.test(r.DATA_TYPE || r.data_type || ""),
-      )
+      .filter((r: any) => /text|blob/i.test(r.DATA_TYPE || r.data_type || ""))
       .map((r: any) => r.COLUMN_NAME || r.column_name),
   );
   return field_names
@@ -902,6 +900,73 @@ export const serial_pk_sql_type = "INT AUTO_INCREMENT";
 export const json_sql_type = "JSON";
 export const indexable_text_sql_type = "VARCHAR(255)";
 export const supports_search_path = false;
+
+// a `references tbl(col) [on delete ...]` clause, as one regex fragment
+const REF = `references\\s+"?\\w+"?\\s*\\([^)]*\\)(?:\\s+on\\s+delete\\s+(?:cascade|set\\s+null|restrict|no\\s+action))?`;
+
+// TEXT columns named in a table-level UNIQUE(...) need a bounded type in
+// MySQL. Find the columns each UNIQUE(...) references and bound their `text`
+// definitions to varchar. (Numeric columns in the same UNIQUE are left alone.)
+const boundTextKeyColumns = (sql: string): string => {
+  const cols = new Set<string>();
+  for (const m of sql.matchAll(/\bunique\s*\(([^)]*)\)/gi))
+    m[1]
+      .split(",")
+      .forEach((c) => cols.add(c.trim().replace(/"/g, "").toLowerCase()));
+  let out = sql;
+  for (const col of cols)
+    out = out.replace(
+      new RegExp(`("?\\b${col}\\b"?\\s+)text\\b`, "gi"),
+      "$1varchar(255)",
+    );
+  return out;
+};
+
+/**
+ * Translate PostgreSQL migration SQL to MySQL (type names, key/default rules,
+ * reserved words, and other dialect differences).
+ */
+export const translateMigrationsFromPostgresql = (sqlIn: string): string => {
+  let sql = sqlIn
+    // UNLOGGED is a Postgres-only durability hint
+    .replace(/\bunlogged\s+table\b/gi, "table")
+    // MySQL has no "IF NOT EXISTS" on CREATE INDEX
+    .replace(
+      /\bcreate\s+(unique\s+)?index\s+if\s+not\s+exists\s+/gi,
+      "create $1index ",
+    )
+    // type names
+    .replace(/\bserial\b/gi, "int auto_increment")
+    .replace(/\bjsonb\b/gi, "json")
+    .replace(/\btimestamptz\b/gi, "timestamp")
+    .replace(/\bbytea\b/gi, "longblob")
+    // ALTER COLUMN ... TYPE t [USING ...] -> MySQL MODIFY COLUMN ... t
+    .replace(
+      /\balter\s+column\s+("?\w+"?)\s+type\s+(\w+(?:\([^)]*\))?)(?:\s+using\s+[^;]+)?/gi,
+      "modify column $1 $2",
+    )
+    // ALTER COLUMN ... SET DEFAULT on a TEXT column is rejected by MySQL; drop
+    // the statement (migrations that use it also backfill via UPDATE)
+    .replace(
+      /alter\s+table\s+[^;]*?\balter\s+column\s+\w+\s+set\s+default\b[^;]*;/gi,
+      "",
+    )
+    // reserved words used as column names
+    .replace(/\b(add\s+column\s+|[,(]\s*)(read|stored)\b/gi, '$1"$2"')
+    // inline column references must come after NOT NULL / DEFAULT in MySQL
+    .replace(new RegExp(`(${REF})\\s+(default\\s+[^\\s,;)]+)`, "gi"), "$2 $1")
+    .replace(new RegExp(`(${REF})\\s+(not\\s+null)`, "gi"), "$2 $1")
+    // TEXT can't be indexed/keyed without a length. Bound inline "text ...
+    // unique/primary key" and the ubiquitous "name text" (frequently keyed).
+    .replace(
+      /\btext\b((?:\s+not\s+null)?\s+(?:unique|primary\s+key))/gi,
+      "varchar(255)$1",
+    )
+    .replace(/(\bname"?\s+)text\b/gi, "$1varchar(255)")
+    // TEXT/JSON/BLOB columns require a parenthesised default expression
+    .replace(/\bdefault\s+('(?:[^']|'')*')/gi, "default ($1)");
+  return boundTextKeyColumns(sql);
+};
 
 /**
  * Create the MySQL database backing a tenant namespace.
