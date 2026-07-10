@@ -1,0 +1,46 @@
+{
+  "name": "@saltcorn/mysql-backend",
+  "version": "0.1.0",
+  "description": "MySQL database backend for Saltcorn, open-source no-code platform",
+  "homepage": "https://saltcorn.com",
+  "scripts": {
+    "test": "cd dist && node --test",
+    "tsc": "tsc -p tsconfig.json",
+    "clean": "rm -rf ./dist/*"
+  },
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./*": "./dist/*.js"
+  },
+  "typesVersions": {
+    "*": {
+      "*": [
+        "dist/*"
+      ]
+    }
+  },
+  "files": [
+    "dist/**/*",
+    "!dist/tsconfig.ref.tsbuildinfo"
+  ],
+  "dependencies": {
+    "@saltcorn/db-common": "file:/Users/gerard/saltcorn/packages/db-common",
+    "csv-parse": "^7.0.1",
+    "mysql2": "^3.22.5"
+  },
+  "optionalDependencies": {
+    "express-mysql-session": "^3.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.43",
+    "typescript": "5.9.2"
+  },
+  "repository": "github:saltcorn/mysql-backend",
+  "publishConfig": {
+    "access": "public"
+  }
+}
