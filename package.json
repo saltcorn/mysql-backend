@@ -28,9 +28,11 @@
     "!dist/tsconfig.ref.tsbuildinfo"
   ],
   "dependencies": {
-    "@saltcorn/db-common": "1.7.0-alpha.0",
     "csv-parse": "^7.0.1",
     "mysql2": "^3.22.5"
+  },
+  "peerDependencies": {
+    "@saltcorn/db-common": ">=1.7.0-alpha.0"
   },
   "optionalDependencies": {
     "express-mysql-session": "^3.0.3"
