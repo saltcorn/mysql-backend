@@ -8,7 +8,7 @@
     "tsc": "tsc -p tsconfig.json",
     "clean": "rm -rf ./dist/*"
   },
-  "author": "",
+  "author": "Tom Nielsen",
   "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
@@ -28,7 +28,7 @@
     "!dist/tsconfig.ref.tsbuildinfo"
   ],
   "dependencies": {
-    "@saltcorn/db-common": "file:/Users/gerard/saltcorn/packages/db-common",
+    "@saltcorn/db-common": "1.7.0-alpha.0",
     "csv-parse": "^7.0.1",
     "mysql2": "^3.22.5"
   },

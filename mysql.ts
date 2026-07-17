@@ -124,6 +124,10 @@ export const mysqlPlaceHolderStack = (): SqlDialect => {
     textCastSuffix() {
       return "";
     },
+    // MySQL's random function is RAND(); postgres/sqlite use RANDOM().
+    randomOrderExpr() {
+      return "RAND()";
+    },
   };
   return self;
 };
@@ -378,9 +382,9 @@ export const insert = async (
     if (v && v.next_version_by_id) {
       valList.push(v.next_version_by_id);
       valPosList.push(
-        `coalesce((select max(\`_version\`) from "${schema}"."${sqlsanitize(
+        `coalesce((select max(\`_version\`) from (select \`_version\` from "${schema}"."${sqlsanitize(
           tbl,
-        )}" where "${v.pk_name || "id"}"=?), 0)+1`,
+        )}" where "${v.pk_name || "id"}"=?) as _h), 0)+1`,
       );
     } else {
       valList.push(mkVal(v));
@@ -718,10 +722,15 @@ export const copyToJson = async (
   tableName: string,
   client?: any,
 ): Promise<any> => {
+  const { Readable } = require("stream");
+  const { pipeline } = require("stream/promises");
   const schema = getTenantSchema();
   const sql = `SELECT * FROM "${schema}"."${sqlsanitize(tableName)}"`;
   const [rows]: any = await (client || getMyClient()).query(sql);
-  for (const row of rows) fileStream.write(JSON.stringify(row) + ",");
+  await pipeline(
+    Readable.from(rows.map((row: any) => JSON.stringify(row) + ",\n")),
+    fileStream,
+  );
 };
 
 export const slugify = (s: string): string =>
@@ -878,7 +887,16 @@ export const whenTransactionisFree = (
   });
 };
 
+const SEARCH_PATH_RE = /^\s*set\s+search_path\s+to\s+"?([^",;]+)"?[^;]*;?\s*$/i;
+
 export const query = async (text: string, params?: any[]): Promise<any> => {
+  const searchPath = text.match(SEARCH_PATH_RE);
+  if (searchPath) {
+    const useSql = `USE \`${sqlsanitize(searchPath[1])}\`;`;
+    sql_log(useSql);
+    const [rows] = await getMyClient().query(useSql);
+    return { rows };
+  }
   const normalized = normalizePlaceholders(text, params);
   sql_log(normalized.text, normalized.params);
   const [rows] = await getMyClient().query(normalized.text, normalized.params);
@@ -899,7 +917,63 @@ export const array_agg_sql_fn = "JSON_ARRAYAGG";
 export const serial_pk_sql_type = "INT AUTO_INCREMENT";
 export const json_sql_type = "JSON";
 export const indexable_text_sql_type = "VARCHAR(255)";
-export const supports_search_path = false;
+// MySQL has no search_path, but query() below maps core's `SET search_path`
+// onto `USE <db>`, which scopes unqualified migration DDL the same way.
+export const supports_search_path = true;
+
+// --- Backend capability flags (see DbExportsType in @saltcorn/db-common) ---
+// Tenants map to one MySQL database each, and every query here is
+// "schema"."table"-qualified, so schema support is on (as for postgres).
+export const supports_multiple_schemas = true;
+export const pools_connections = true;
+export const supports_for_update = true;
+// MySQL has no postgres-style row-level security.
+export const supports_row_level_security = false;
+export const supports_alter_table = true;
+export const supports_non_integer_pk = true;
+// mysql2 parses JSON columns into JS values on read, but rejects unstringified
+// values on write (verified: binding a plain object raises ER_INVALID_JSON_TEXT).
+// Letting core stringify covers JSON scalars too, which mkVal alone would miss.
+export const json_read_returns_string = false;
+export const json_write_needs_stringify = true;
+// the pool is built with dateStrings:false, so DATETIME reads back as a Date.
+export const stores_dates_as_text = false;
+export const supports_large_bind_lists = true;
+export const supports_database_views = true;
+export const supports_table_discovery = true;
+// getExpressSessionStore below honours pruneInterval via clearExpired.
+export const supports_session_pruning = true;
+
+// Defer FK checks for the remainder of the current transaction. MySQL has no
+// transaction-scoped equivalent of postgres's SET CONSTRAINTS ALL DEFERRED;
+// foreign_key_checks is session-scoped, so it stays off for the rest of this
+// connection's life and is reset when the client is released back to the pool.
+export const deferForeignKeys = async (client: {
+  query: (sql: string) => Promise<any>;
+}): Promise<void> => {
+  await client.query("SET FOREIGN_KEY_CHECKS = 0");
+};
+
+// Pull the offending field name out of a unique-violation error message.
+// e.g. `Duplicate entry 'x' for key 'books.books_author_unique'`
+export const parseUniqueConstraintError = (
+  msg: string,
+  tableName: string,
+): string => {
+  const m = msg.match(/duplicate entry .* for key '(?:[^'.]*\.)?(.*?)_unique'/i);
+  if (!m) return "";
+  // constraints are named "<table>_<field1>_<field2>_unique"
+  return m[1].startsWith(`${tableName}_`)
+    ? m[1].slice(tableName.length + 1)
+    : m[1];
+};
+
+// Canonical key for a multi-field unique constraint, to compare against the
+// field name parsed above (same "<field1>_<field2>" convention as postgres).
+export const uniqueConstraintFieldsKey = (
+  fields: string[],
+  _tableName: string,
+): string => fields.join("_");
 
 // a `references tbl(col) [on delete ...]` clause, as one regex fragment
 const REF = `references\\s+"?\\w+"?\\s*\\([^)]*\\)(?:\\s+on\\s+delete\\s+(?:cascade|set\\s+null|restrict|no\\s+action))?`;
@@ -935,6 +1009,9 @@ export const translateMigrationsFromPostgresql = (sqlIn: string): string => {
       /\bcreate\s+(unique\s+)?index\s+if\s+not\s+exists\s+/gi,
       "create $1index ",
     )
+    // ...nor on ALTER TABLE ADD COLUMN. Migrations run once per schema
+    // (tracked in _sc_migrations), so the existence guard is redundant here.
+    .replace(/\badd\s+column\s+if\s+not\s+exists\s+/gi, "add column ")
     // type names
     .replace(/\bserial\b/gi, "int auto_increment")
     .replace(/\bjsonb\b/gi, "json")
