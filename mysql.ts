@@ -24,6 +24,9 @@ import type {
 import tenantsModule from "@saltcorn/db-common/tenants";
 import { reprAsJson } from "@saltcorn/db-common/sqlite-commons";
 
+const ISO_DATETIME_RE =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+
 /**
  * mysql2 does not auto-serialize bound parameters into JSON (unlike `pg`,
  * which handles JS objects for jsonb columns itself) - plain objects/arrays
@@ -31,7 +34,18 @@ import { reprAsJson } from "@saltcorn/db-common/sqlite-commons";
  * instances are left untouched so mysql2 can bind them as proper
  * DATETIME/DATE values.
  */
-const mkVal = (v: any): any => (reprAsJson(v) ? JSON.stringify(v) : v);
+const mkVal = (v: any): any => {
+  if (typeof v === "number" && Number.isNaN(v)) return null;
+  if (Buffer.isBuffer(v)) return v;
+  if (v?.constructor?.name === "PlainDate" && typeof v.toISOString === "function")
+    return v.toISOString();
+  if (reprAsJson(v)) return JSON.stringify(v);
+  if (typeof v === "string" && ISO_DATETIME_RE.test(v)) {
+    const d = new Date(v);
+    if (!isNaN(d.getTime())) return d;
+  }
+  return v;
+};
 
 const normalizePlaceholders = (
   text: string,
@@ -50,10 +64,16 @@ let getTenantSchema: () => string;
 let getRequestContext: () => any;
 let getConnectObject: ((connObj?: any) => any) | null = null;
 export let pool: Pool | null = null;
+let sessionPool: Pool | null = null;
 
 let log_sql_enabled = false;
 
-const quote = (s: string): string => `"${s}"`;
+const quote = (s: string): string =>
+  s.includes(".")
+    ? s.split(".").map(quote).join(".")
+    : s.includes('"')
+      ? s
+      : `"${s}"`;
 
 const ppPK = (pk?: string): string => (pk ? quote(pk) : "id");
 
@@ -96,9 +116,10 @@ export const mysqlPlaceHolderStack = (): SqlDialect => {
       return !doCast ? s : `DATE(${s})`;
     },
     jsonExtractExpr(fieldExpr: string, jsonPath: string, asText: boolean) {
+      const p = jsonPath.replace(/\\/g, "\\\\");
       return asText
-        ? `JSON_UNQUOTE(JSON_EXTRACT(${fieldExpr}, '${jsonPath}'))`
-        : `JSON_EXTRACT(${fieldExpr}, '${jsonPath}')`;
+        ? `JSON_UNQUOTE(JSON_EXTRACT(${fieldExpr}, '${p}'))`
+        : `JSON_EXTRACT(${fieldExpr}, '${p}')`;
     },
     ftsWhereClause(v) {
       // A true MATCH()...AGAINST() implementation needs a FULLTEXT index on
@@ -119,7 +140,7 @@ export const mysqlPlaceHolderStack = (): SqlDialect => {
     slugifyWhereClause(k: string, s: string) {
       return `REGEXP_REPLACE(REPLACE(LOWER(${quote(
         sqlsanitizeAllowDots(k),
-      )}),' ','-'),'[^\\w-]','')=${push(s)}`;
+      )}),' ','-'),'[^\\\\w-]','')=${push(s)}`;
     },
     textCastSuffix() {
       return "";
@@ -167,6 +188,14 @@ export function sql_log(sql: string, vs?: any): void {
     else console.log(sql, vs);
 }
 
+const boolTypeCast = (field: any, next: () => any): any => {
+  if (field.type === "TINY" && field.length === 1) {
+    const v = field.string();
+    return v === null ? null : v === "1";
+  }
+  return next();
+};
+
 const buildPool = (connectObj: any): Pool => {
   // DATABASE_URL takes priority over discrete host/user/password/database in
   // connect.ts's getConnectObject() (which deletes the discrete fields when
@@ -175,11 +204,13 @@ const buildPool = (connectObj: any): Pool => {
   // an alternative to an options object, same idea as `pg`'s Pool accepting
   // `{ connectionString }`.
   const newPool = connectObj.connectionString
-    ? mysql.createPool(
-        `${connectObj.connectionString}${
+    ? mysql.createPool({
+        uri: `${connectObj.connectionString}${
           connectObj.connectionString.includes("?") ? "&" : "?"
         }multipleStatements=true`,
-      )
+        typeCast: boolTypeCast,
+        timezone: "Z",
+      })
     : mysql.createPool({
         host: connectObj.host,
         port: connectObj.port ? +connectObj.port : undefined,
@@ -188,6 +219,16 @@ const buildPool = (connectObj: any): Pool => {
         database: connectObj.database || connectObj.default_schema,
         ssl: connectObj.ssl,
         dateStrings: false,
+        // Treat all DATETIME values as UTC (matching postgres's timestamptz).
+        // Combined with `SET time_zone='+00:00'` per connection, NOW(3)/
+        // FROM_UNIXTIME and Date round-trips stay consistent regardless of the
+        // server's or node process's local timezone (otherwise db.time() drifts
+        // by the offset between them and the sync time-window comparisons break).
+        timezone: "Z",
+        // MySQL has no boolean type - Saltcorn's Bool maps to tinyint(1). Coerce
+        // it back to a JS boolean so reads match postgres even where the type's
+        // own read is bypassed (joined fields, stored calculated JSON).
+        typeCast: boolTypeCast,
         // migrations and some bootstrap SQL bundle several ";"-separated
         // statements in one query() call, which pg/sqlite3 both tolerate -
         // mysql2 needs this explicitly enabled to match.
@@ -204,6 +245,8 @@ const buildPool = (connectObj: any): Pool => {
     connection.query(
       "SET SESSION sql_mode = (SELECT CONCAT(@@sql_mode, ',ANSI_QUOTES,PIPES_AS_CONCAT'))",
     );
+    connection.query("SET collation_connection = @@collation_server");
+    connection.query("SET time_zone = '+00:00'");
   });
   return newPool;
 };
@@ -215,6 +258,8 @@ const buildPool = (connectObj: any): Pool => {
 export const close = async (): Promise<void> => {
   if (pool) await pool.end();
   pool = null;
+  if (sessionPool) await sessionPool.end();
+  sessionPool = null;
 };
 
 /**
@@ -259,12 +304,51 @@ export const select = async (
 ): Promise<Row[]> => {
   const { where, values } = mkWhere(whereObj);
   const schema = selectopts.schema || getTenantSchema();
+  const qtbl = `"${schema}"."${sqlsanitize(tbl)}"`;
+
+  if (selectopts.tree_field && !(whereObj as any)?.[selectopts.tree_field]) {
+    const tf = sqlsanitize(selectopts.tree_field);
+    const pk = sqlsanitize(selectopts.pk_name || "id");
+    const ob =
+      typeof selectopts.orderBy === "string"
+        ? sqlsanitize(selectopts.orderBy)
+        : pk;
+    const cmp = selectopts.orderDesc ? ">" : "<";
+    const rank = (alias: string, rootScope: boolean) =>
+      `(select count(*) from ${qtbl} sib where ${
+        rootScope ? `sib."${tf}" is null` : `sib."${tf}" = ${alias}."${tf}"`
+      } and (sib."${ob}" ${cmp} ${alias}."${ob}" or (sib."${ob}" = ${alias}."${ob}" and sib."${pk}" < ${alias}."${pk}")))`;
+    const anchorFields = selectopts.fields
+      ? selectopts.fields.map((f) => `"${sqlsanitize(f)}"`).join(", ")
+      : "*";
+    const recurFields = selectopts.fields
+      ? selectopts.fields.map((f) => `p."${sqlsanitize(f)}"`).join(", ")
+      : "p.*";
+    const finalFields = selectopts.fields
+      ? `${selectopts.fields.map((f) => `"${sqlsanitize(f)}"`).join(", ")}, _level`
+      : "*";
+    const whereAnd = where ? `and ${where.replace(/^\s*where\s+/i, "")}` : "";
+    const treeSql = `WITH RECURSIVE _tree AS (
+        SELECT ${anchorFields}, 0 as _level,
+          CAST(LPAD(${rank("p", true)}, 10, '0') AS CHAR(2000)) as _sort_path
+        FROM ${qtbl} p
+        WHERE p."${tf}" IS NULL ${whereAnd}
+      UNION ALL
+        SELECT ${recurFields}, pt._level+1,
+          CONCAT(pt._sort_path, '.', LPAD(${rank("p", false)}, 10, '0'))
+        FROM ${qtbl} p
+        JOIN _tree pt ON p."${tf}" = pt."${pk}"
+      )
+      SELECT ${finalFields} FROM _tree ${where} ORDER BY _sort_path`;
+    const treeValues = where ? [...values, ...values] : values;
+    sql_log(treeSql, treeValues);
+    const [treeRows] = await getMyClient(selectopts).query(treeSql, treeValues);
+    return treeRows as Row[];
+  }
+
   const sql = `SELECT ${
     selectopts.fields ? selectopts.fields.join(", ") : `*`
-  } FROM "${schema}"."${sqlsanitize(tbl)}" ${where} ${mkSelectOptions(
-    selectopts,
-    values,
-  )}`;
+  } FROM ${qtbl} ${where} ${mkSelectOptions(selectopts, values)}`;
   sql_log(sql, values);
   const [rows] = await getMyClient(selectopts).query(sql, values);
   return rows as Row[];
@@ -403,8 +487,8 @@ export const insert = async (
   sql_log(sql, valList);
   const [result]: any = await client.query(sql, valList);
   if (opts.noid) return;
-  else if (opts.onConflictDoNothing && !result.insertId) return;
-  else return result.insertId;
+  else if (opts.onConflictDoNothing && !result.affectedRows) return;
+  else return result.insertId || obj[opts.pk_name || "id"];
 };
 
 /**
@@ -551,20 +635,32 @@ const keyColumnExprs = async (
   field_names: string[],
 ): Promise<string> => {
   const [rows]: any = await getMyClient().query(
-    `SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS
-     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`,
-    [getTenantSchema(), table_name],
+    `SHOW COLUMNS FROM "${getTenantSchema()}"."${sqlsanitize(table_name)}"`,
   );
-  const needsPrefix = new Set(
-    rows
-      .filter((r: any) => /text|blob/i.test(r.DATA_TYPE || r.data_type || ""))
-      .map((r: any) => r.COLUMN_NAME || r.column_name),
+  const typeOf: Record<string, string> = {};
+  for (const r of rows) typeOf[r.Field || r.field] = (r.Type || r.type || "").toLowerCase();
+  const strLen = (t: string): number | null => {
+    if (/text|blob/.test(t)) return Infinity;
+    const m = t.match(/^(?:var)?char\((\d+)\)/);
+    return m ? parseInt(m[1], 10) : null; // null => not a string column
+  };
+  const cols = field_names.map((f) => {
+    const s = sqlsanitize(f);
+    return { s, len: strLen(typeOf[s] || "") };
+  });
+  const strCols = cols.filter((c) => c.len !== null);
+  const otherBytes = (cols.length - strCols.length) * 8;
+  const budgetChars = Math.max(1, Math.floor((3000 - otherBytes) / 4));
+  const perColChars = Math.max(
+    1,
+    Math.floor(budgetChars / Math.max(1, strCols.length)),
   );
-  return field_names
-    .map(
-      (f) =>
-        `"${sqlsanitize(f)}"${needsPrefix.has(sqlsanitize(f)) ? "(191)" : ""}`,
-    )
+  return cols
+    .map(({ s, len }) => {
+      if (len === null) return `"${s}"`;
+      const cap = Math.min(len, perColChars);
+      return cap < len ? `"${s}"(${cap})` : `"${s}"`;
+    })
     .join(",");
 };
 
@@ -740,7 +836,7 @@ export const slugify = (s: string): string =>
     .replace(/[^\w-]/g, "");
 
 export const time = async (): Promise<Date> => {
-  const [rows]: any = await getMyClient().query("select now() as now");
+  const [rows]: any = await getMyClient().query("select now(3) as now");
   return new Date(rows[0].now);
 };
 
@@ -829,14 +925,22 @@ export const tryCatchInTransaction = async (
 ): Promise<any> => {
   const rndid = Math.floor(Math.random() * 16777215).toString(16);
   const reqCon = getRequestContext();
+  const savepoint = async (stmt: string) => {
+    if (!reqCon?.client) return;
+    try {
+      await query(stmt);
+    } catch (e: any) {
+      if (e?.code !== "ER_SP_DOES_NOT_EXIST") throw e;
+    }
+  };
   if (reqCon?.client) await query(`SAVEPOINT sp${rndid}`);
   try {
     return await f();
   } catch (error) {
-    if (reqCon?.client) await query(`ROLLBACK TO SAVEPOINT sp${rndid}`);
+    await savepoint(`ROLLBACK TO SAVEPOINT sp${rndid}`);
     if (onError) return await onError(error as Error);
   } finally {
-    if (reqCon?.client) await query(`RELEASE SAVEPOINT sp${rndid}`);
+    await savepoint(`RELEASE SAVEPOINT sp${rndid}`);
   }
 };
 
@@ -889,6 +993,23 @@ export const whenTransactionisFree = (
 
 const SEARCH_PATH_RE = /^\s*set\s+search_path\s+to\s+"?([^",;]+)"?[^;]*;?\s*$/i;
 
+const DDL_RE = /^\s*(create\s+table|alter\s+table)\b/i;
+
+const translateDdlTypes = (text: string): string =>
+  boundTextKeyColumns(
+    text
+      .replace(/\bjsonb\b/gi, "json")
+      .replace(/\btimestamptz\b/gi, "timestamp")
+      .replace(/\bbytea\b/gi, "longblob")
+      .replace(/\buuid\b/gi, "char(36)")
+      .replace(/uuid_generate_v4\(\)/gi, "(uuid())")
+      .replace(/\bserial\b/gi, "int auto_increment")
+      .replace(
+        /\btext\b((?:\s+not\s+null)?\s+(?:unique|primary\s+key))/gi,
+        "varchar(255)$1",
+      ),
+  );
+
 export const query = async (text: string, params?: any[]): Promise<any> => {
   const searchPath = text.match(SEARCH_PATH_RE);
   if (searchPath) {
@@ -897,6 +1018,7 @@ export const query = async (text: string, params?: any[]): Promise<any> => {
     const [rows] = await getMyClient().query(useSql);
     return { rows };
   }
+  if (DDL_RE.test(text)) text = translateDdlTypes(text);
   const normalized = normalizePlaceholders(text, params);
   sql_log(normalized.text, normalized.params);
   const [rows] = await getMyClient().query(normalized.text, normalized.params);
@@ -983,7 +1105,7 @@ const REF = `references\\s+"?\\w+"?\\s*\\([^)]*\\)(?:\\s+on\\s+delete\\s+(?:casc
 // definitions to varchar. (Numeric columns in the same UNIQUE are left alone.)
 const boundTextKeyColumns = (sql: string): string => {
   const cols = new Set<string>();
-  for (const m of sql.matchAll(/\bunique\s*\(([^)]*)\)/gi))
+  for (const m of sql.matchAll(/\b(?:unique|primary\s+key)\s*\(([^)]*)\)/gi))
     m[1]
       .split(",")
       .forEach((c) => cols.add(c.trim().replace(/"/g, "").toLowerCase()));
@@ -1025,8 +1147,8 @@ export const translateMigrationsFromPostgresql = (sqlIn: string): string => {
     // ALTER COLUMN ... SET DEFAULT on a TEXT column is rejected by MySQL; drop
     // the statement (migrations that use it also backfill via UPDATE)
     .replace(
-      /alter\s+table\s+[^;]*?\balter\s+column\s+\w+\s+set\s+default\b[^;]*;/gi,
-      "",
+      /alter\s+table\s+(\S+)\s+alter\s+column\s+(\w+)\s+set\s+default\s+('(?:[^']|'')*')\s*;/gi,
+      "alter table $1 modify column $2 text default ($3);",
     )
     // reserved words used as column names
     .replace(/\b(add\s+column\s+|[,(]\s*)(read|stored)\b/gi, '$1"$2"')
@@ -1099,6 +1221,19 @@ export const getExpressSessionStore = (
   opts: { pruneInterval?: number } = {},
 ): any => {
   const MySQLStore = require("express-mysql-session")(session);
+  if (!sessionPool) {
+    const connectObj = getConnectObject!();
+    sessionPool = connectObj.connectionString
+      ? mysql.createPool(connectObj.connectionString)
+      : mysql.createPool({
+          host: connectObj.host,
+          port: connectObj.port ? +connectObj.port : undefined,
+          user: connectObj.user,
+          password: connectObj.password,
+          database: connectObj.database || connectObj.default_schema,
+          ssl: connectObj.ssl,
+        });
+  }
   return new MySQLStore(
     {
       schema: {
@@ -1113,7 +1248,7 @@ export const getExpressSessionStore = (
       clearExpired: (opts.pruneInterval ?? 0) > 0,
       checkExpirationInterval: (opts.pruneInterval ?? 0) * 1000 || undefined,
     },
-    pool,
+    sessionPool,
   );
 };
 
